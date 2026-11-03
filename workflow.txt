@@ -1,0 +1,103 @@
+# Workflow Overview
+
+This project provides a web‑based tool for invisibly watermarking a sentence (or any short text) by embedding a payload of user‑supplied details using zero‑width Unicode characters. The watermark is reversible: the original visible text can be perfectly recovered, and the embedded payload can be extracted later.
+
+## How the system works
+
+1. **Input** – The user enters an original sentence and specifies the details to embed, such as an owner name, document ID, version number, or any short string. These details are called the *payload*.
+
+2. **Encoding** – The encoder (BaselineEncoder component) converts the payload string into UTF‑8 bytes, then builds a frame consisting of a 4‑byte magic constant "AWL1", a 1‑byte version number (0x01), a 2‑byte big‑endian length field, the payload bytes themselves, and a 1‑byte checksum that covers the preceding fields. Each bit of the frame is mapped to a zero‑width character: a bit value of 0 becomes the zero‑width space U+200B, and a bit value of 1 becomes the zero‑width non‑joiner U+200C. The marker characters are then woven into the original text without altering any visible glyph, according to the chosen insertion strategy (*start*, *end*, or *distributed* spaced every *stride* positions). The output is a visually identical piece of text that secretly carries the payload.
+
+3. **Display** – The marked copy is shown in the UI. Because the marker characters are zero‑width, they do not affect line‑breaking, spacing, or any rendered appearance. The user can copy the marked text and share it just like normal text.
+
+4. **Decoding** – When the marked text is later passed to the Decoder component, the system scans for U+200B/U+200C characters, collects the embedded bits, and reconstructs the frame. It validates the magic bytes, version, length, and checksum. If all checks pass, the decoder reports a *complete* status and returns the recovered payload string. If the frame is truncated or corrupted, it reports *partial* or *invalid* status respectively. If no marker characters are found, the status is *absent*.
+
+5. **Extracted details** – The recovered payload can be displayed as plain text (e.g., "owner=alice;doc=1;v=1") or copied to the clipboard. The decoder also strips the markers and shows the visible text, confirming that the original sentence remains unchanged.
+
+## Key points
+
+- **Invisible** – The watermark uses only zero‑width Unicode characters, so the marked text looks exactly like the original on screen and in most editors.
+- **Reversible** – Removing every U+200B/U+200C restores the original visible text without any loss.
+- **No secret key** – The same payload can be embedded by anyone; the system only proves that a frame is present, not who authored the document.
+- **Limitations** – The watermark is fragile: stripping zero‑width characters, re‑typing, or converting to formats that discard such characters (e.g., PDF) will destroy it. It is also detectable by a simple scan for zero‑width code points.
+
+In summary, the project lets a user take any sentence, attach arbitrary details as a hidden payload, and later retrieve those details without any visible trace, all within the browser.
+## Deep Embedding Mechanism (condensed)
+
+The watermarking logic lives in `src/lib/watermark.ts` and consists of an **embed** phase and a **extract** phase.
+
+### 1. Payload → UTF‑8 bytes
+`utf8StringToBytes` turns the user string into a byte array of length L (1‑4 bytes per Unicode code point).
+
+### 2. Frame layout (big‑endian)
+`buildFrame` prepends a 7‑byte header:
+
+| Bytes | Content |
+|------|----------|
+| 4    | MAGIC = `0x41 0x57 0x4C 0x31` (“AWL1”) |
+| 1    | VERSION = `0x01` |
+| 2    | LENGTH = payload length L (big‑endian) |
+| L    | PAYLOAD = raw UTF‑8 payload bytes |
+| 1    | CHECKSUM = `(VERSION + LEN_HI + LEN_LO + sum(payload)) mod 256` |
+
+If L > 65 535 the encoder aborts.
+
+### 3. Bits → zero‑width chars
+`bytesToBits` produces a 0/1 array (MSB first). Mapping:
+
+| Bit | Character | Code point |
+|-----|-----------|------------|
+| 0   | U+200B (ZERO WIDTH SPACE) |
+| 1   | U+200C (ZERO WIDTH NON‑JOINER) |
+
+### 4. Insertion strategies
+- **start** – all markers after the first character.
+- **end** – all markers after the last character.
+- **distributed** – `stride` (default 8) spreads markers: `distributeMarkers` walks the text and inserts a marker whenever `index % stride === 0` until all frame bits are used.
+
+### 5. Marked output
+`encodeWatermark` returns `marked` (the sentence with invisible chars inserted), `markerCount`, `payloadBytes`, `frameBytes`, `overheadRatio`. Rendering is unchanged because the chars are zero‑width.
+
+### 6. Decoding / “patch”
+1. **Detect markers** – `summarizeInvisible` lists every U+200B/U+200C; if none → status `absent`.
+2. **Collect bits** – read markers in order; U+200B→0, U+200C→1; reassemble via `bitsToBytes`.
+3. **Validate frame** – first 7 bytes checked for magic `"AWL1"`, version `0x01`, length, and checksum.
+4. **Recover payload** – if checksum matches, payload bytes are decoded with `utf8BytesToString`; result status `complete`.
+5. **Strip markers** – `stripMarkers` removes all U+200B/U+200C, restoring the original visible sentence for the UI.
+
+### 7. Known limitations
+- Any operation that removes invisible characters (PDF generation, IDE cleanup, etc.) destroys the watermark.
+- Manual re‑typing or OCR eliminates the markers.
+- If the original text already contains U+200B/U+200C, the encoder may mis‑interpret them (UI warns).
+- Heavy truncation can cut the marker run short → `partial` decode status.
+
+### 8. Text‑only flow diagram
+
+```
+user payload
+   │
+   ▼  utf8StringToBytes
+payload bytes
+   │
+   ▼  buildFrame (magic+ver+len+payload+checksum)
+frame bytes
+   │
+   ▼  bytesToBits → map 0→U+200B, 1→U+200C
+marker run (invisible chars)
+   │
+   ▼  insert via strategy (start/end/distributed)
+marked sentence (visual unchanged)
+   │
+   ▼  user copies / transmits
+marked sentence
+   │
+   ▼  decodeWatermark
+   │   ├─ summarizeInvisible (locate markers)
+   │   ├─ collect bits & bitsToBytes
+   │   ├─ validate magic/version/length/checksum
+   │   └─ utf8BytesToString → recovered payload
+   │
+   └─ stripMarkers → visibleText (original sentence)
+```
+
+This client‑side, key‑less scheme is intended as a **benchmark reference** for reversible invisible‑watermark research, but its fragility (zero‑width stripping, truncation, pre‑existing markers) must be kept in mind.
